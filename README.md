@@ -43,10 +43,14 @@
 - **Memory Optimization:** Tuned Gorilla WebSocket socket buffers to 512 bytes (saving ~70MB of RAM across 10,000 persistent connections).
 - **Verification:** 10,000 pings across 50 concurrent goroutines processed in **65ms** with 0 data races.
 
-### Milestone 3: Matching Engine & Atomic Claim State Machine (Next)
-- Order ingestion (`POST /api/v1/orders`) triggering radial candidate searches.
-- Per-rider atomic Compare-And-Swap (`sync/atomic`) state machine (`Idle -> Offered -> Assigned`).
-- Non-blocking cascades when candidates are claimed by competing orders.
+### Milestone 3: Matching Engine & Atomic Claim State Machine (Complete)
+- **Lockless Rider State Machine:** 100% lockless atomic CAS state transitions (`StateIdle -> StateOffered -> StateAssigned`) with 64-bit numeric order ID binding via hardware `atomic.CompareAndSwapUint32`.
+- **Auto-Cascading Dispatch:** Instantaneous cascade to adjacent candidates when a candidate is raced or busy, without global mutex convoys.
+- **Unified HTTP/WebSocket Server:** `internal/server` tying M1 (Spatial Index), M2 (Ingestion Pipeline), and M3 (Matching Engine) together.
+- **Verification:** 
+  - Thundering Herd: 50 concurrent goroutines competing for 1 rider $\rightarrow$ exactly 1 winner, 49 cleanly rejected with `ErrNoRidersAvailable`.
+  - Scale Concurrency: 50 orders vs 50 riders in the same cell at the exact same microsecond $\rightarrow$ 1:1 bipartite matching, 0 double-bookings, 0 split-brain states, 0 data races.
+  - Full End-to-End Test: Live WebSocket GPS streaming while concurrent orders fire and match in sub-100ms.
 
 ### Milestone 4: Offer Lifecycle, Timeouts & Cascades
 - 15-second acceptance window with active deadline reaping via `time.Timer`.
