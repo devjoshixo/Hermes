@@ -6,6 +6,8 @@
 *.dylib
 bin/
 dist/
+# GPT review and suggestions
+gpt*.md
 
 # Test binary, built with `go test -c`
 *.test
