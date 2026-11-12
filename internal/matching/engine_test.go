@@ -284,3 +284,123 @@ func TestEngine_ScaleConcurrency_50Orders_50Riders(t *testing.T) {
 		}
 	}
 }
+
+func TestEngine_DuplicateOrder_Singleflight(t *testing.T) {
+	cpLat := 28.6315
+	cpLng := 77.2167
+	cpCell := uint64(h3.FromGeo(h3.GeoCoord{Latitude: cpLat, Longitude: cpLng}, 8))
+
+	idx := spatial.NewSpatialIndex(64)
+	engine := NewEngine(idx, 5*time.Second)
+
+	// Two riders available at Connaught Place
+	riderA := NewRider("rider_A")
+	riderB := NewRider("rider_B")
+	engine.RegisterRider(riderA)
+	engine.RegisterRider(riderB)
+	idx.UpdatePosition("rider_A", cpCell)
+	idx.UpdatePosition("rider_B", cpCell)
+
+	const duplicateRequests = 20
+	const targetOrderID = uint64(999)
+
+	var (
+		wg           sync.WaitGroup
+		startGun     = make(chan struct{})
+		matchedRiders = make([]string, duplicateRequests)
+		mu           sync.Mutex
+	)
+
+	// Fire 20 concurrent duplicate requests for the EXACT SAME order ID
+	for i := 0; i < duplicateRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-startGun
+
+			order := Order{
+				ID:        targetOrderID,
+				PickupLat: cpLat,
+				PickupLng: cpLng,
+			}
+
+			matched, err := engine.MatchOrder(order, 1, 5)
+			if err != nil {
+				t.Errorf("request %d failed: %v", idx, err)
+				return
+			}
+
+			mu.Lock()
+			matchedRiders[idx] = matched.ID
+			mu.Unlock()
+		}(i)
+	}
+
+	// Release all 20 duplicate requests simultaneously
+	close(startGun)
+	wg.Wait()
+
+	// Invariant 1: All 20 requests must return the EXACT same rider
+	firstRider := matchedRiders[0]
+	if firstRider == "" {
+		t.Fatalf("first request returned empty rider")
+	}
+
+	for i, rID := range matchedRiders {
+		if rID != firstRider {
+			t.Fatalf("IDEMPOTENCY VIOLATION: request %d got %s, but expected %s", i, rID, firstRider)
+		}
+	}
+
+	// Invariant 2: Exactly ONE rider was claimed; the other rider MUST still be StateIdle!
+	otherRider := riderB
+	if firstRider == "rider_B" {
+		otherRider = riderA
+	}
+
+	if otherRider.State() != StateIdle {
+		t.Fatalf("LEAKED ALLOCATION: second rider %s was offered an order even though it was a duplicate!", otherRider.ID)
+	}
+	if otherRider.AssignedOrderID() != 0 {
+		t.Fatalf("second rider %s has assigned order ID %d, expected 0", otherRider.ID, otherRider.AssignedOrderID())
+	}
+}
+
+func TestEngine_DuplicateOrder_FailureEviction(t *testing.T) {
+	cpLat := 28.6315
+	cpLng := 77.2167
+	cpCell := uint64(h3.FromGeo(h3.GeoCoord{Latitude: cpLat, Longitude: cpLng}, 8))
+
+	idx := spatial.NewSpatialIndex(64)
+	engine := NewEngine(idx, 5*time.Second)
+
+	order := Order{
+		ID:        888,
+		PickupLat: cpLat,
+		PickupLng: cpLng,
+	}
+
+	// 1. Initial attempt with 0 riders available -> must fail
+	_, err := engine.MatchOrder(order, 1, 5)
+	if !errors.Is(err, ErrNoRidersAvailable) {
+		t.Fatalf("expected ErrNoRidersAvailable, got %v", err)
+	}
+
+	// 2. Rider logs on 2 seconds later at Connaught Place
+	newRider := NewRider("rider_arrived_late")
+	engine.RegisterRider(newRider)
+	idx.UpdatePosition("rider_arrived_late", cpCell)
+
+	// 3. User retries the same order -> must succeed (failure was evicted, not frozen)
+	matched, err := engine.MatchOrder(order, 1, 5)
+	if err != nil {
+		t.Fatalf("expected retry to succeed after supply arrived, got error: %v", err)
+	}
+
+	if matched.ID != "rider_arrived_late" {
+		t.Fatalf("expected matched rider to be rider_arrived_late, got %s", matched.ID)
+	}
+	if matched.State() != StateOffered {
+		t.Fatalf("expected rider to be StateOffered, got %d", matched.State())
+	}
+}

@@ -16,12 +16,23 @@ var (
 	ErrRiderNotFound = errors.New("rider not found")
 )
 
+// orderFlight tracks an in-flight or completed order matching operation.
+// Concurrent duplicates wait on the done channel, receiving the identical outcome.
+type orderFlight struct {
+	done  chan struct{}
+	rider *Rider
+	err   error
+}
+
 // Engine coordinates spatial queries and atomic rider dispatch.
 type Engine struct {
 	spatialIndex *spatial.SpatialIndex
 	ridersMu     sync.RWMutex
 	riders       map[string]*Rider
 	offerTimeout time.Duration
+
+	ordersMu sync.Mutex
+	orders   map[uint64]*orderFlight
 }
 
 // NewEngine initializes a matching engine.
@@ -33,6 +44,7 @@ func NewEngine(spatialIndex *spatial.SpatialIndex, offerTimeout time.Duration) *
 		spatialIndex: spatialIndex,
 		riders:       make(map[string]*Rider),
 		offerTimeout: offerTimeout,
+		orders:       make(map[uint64]*orderFlight),
 	}
 }
 
@@ -58,12 +70,44 @@ func (e *Engine) GetRider(riderID string) *Rider {
 }
 
 // MatchOrder searches nearby H3 rings and atomically offers the order to the first idle candidate.
-// It auto-cascades to the next candidate if a rider is raced or busy.
+// It includes singleflight idempotency: concurrent duplicate requests for the same order ID
+// coalesce into a single matching operation, guaranteeing exactly one rider allocation.
 func (e *Engine) MatchOrder(order Order, maxK int, limit int) (*Rider, error) {
 	if maxK < 0 || limit <= 0 {
 		return nil, ErrNoRidersAvailable
 	}
 
+	// 1. Idempotency & In-Flight Coalescing
+	e.ordersMu.Lock()
+	if flight, exists := e.orders[order.ID]; exists {
+		e.ordersMu.Unlock()
+		<-flight.done // Wait for in-flight match to complete
+		return flight.rider, flight.err
+	}
+
+	flight := &orderFlight{done: make(chan struct{})}
+	e.orders[order.ID] = flight
+	e.ordersMu.Unlock()
+
+	// 2. Perform candidate search & CAS offer
+	matchedRider, err := e.searchAndOffer(order, maxK, limit)
+
+	// 3. Record outcome and wake any waiting duplicate requests
+	flight.rider = matchedRider
+	flight.err = err
+	close(flight.done)
+
+	// 4. Failure eviction: do not freeze failures into memory so future retries can succeed
+	if err != nil {
+		e.ordersMu.Lock()
+		delete(e.orders, order.ID)
+		e.ordersMu.Unlock()
+	}
+
+	return matchedRider, err
+}
+
+func (e *Engine) searchAndOffer(order Order, maxK int, limit int) (*Rider, error) {
 	coord := h3.GeoCoord{
 		Latitude:  order.PickupLat,
 		Longitude: order.PickupLng,
@@ -90,6 +134,13 @@ func (e *Engine) MatchOrder(order Order, maxK int, limit int) (*Rider, error) {
 	}
 
 	return nil, ErrNoRidersAvailable
+}
+
+// ClearOrder removes an order from the idempotency registry once delivered or cancelled.
+func (e *Engine) ClearOrder(orderID uint64) {
+	e.ordersMu.Lock()
+	delete(e.orders, orderID)
+	e.ordersMu.Unlock()
 }
 
 // AcceptOrder records rider acceptance, transitioning StateOffered -> StateAssigned.
