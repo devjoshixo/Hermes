@@ -17,14 +17,24 @@ var (
 )
 
 // orderFlight tracks an in-flight or completed order matching operation.
-// Concurrent duplicates wait on the done channel, receiving the identical outcome.
 type orderFlight struct {
 	done  chan struct{}
 	rider *Rider
 	err   error
 }
 
-// Engine coordinates spatial queries and atomic rider dispatch.
+// activeOffer tracks an offered order lease with its deadline timer and candidate cascade list.
+type activeOffer struct {
+	timer      *time.Timer
+	order      Order
+	riderID    string
+	candidates []string
+	candIndex  int
+	maxK       int
+	limit      int
+}
+
+// Engine coordinates spatial queries, atomic rider dispatch, and lease lifecycle.
 type Engine struct {
 	spatialIndex *spatial.SpatialIndex
 	ridersMu     sync.RWMutex
@@ -33,6 +43,9 @@ type Engine struct {
 
 	ordersMu sync.Mutex
 	orders   map[uint64]*orderFlight
+
+	offersMu sync.Mutex
+	offers   map[uint64]*activeOffer
 }
 
 // NewEngine initializes a matching engine.
@@ -45,6 +58,7 @@ func NewEngine(spatialIndex *spatial.SpatialIndex, offerTimeout time.Duration) *
 		riders:       make(map[string]*Rider),
 		offerTimeout: offerTimeout,
 		orders:       make(map[uint64]*orderFlight),
+		offers:       make(map[uint64]*activeOffer),
 	}
 }
 
@@ -70,8 +84,7 @@ func (e *Engine) GetRider(riderID string) *Rider {
 }
 
 // MatchOrder searches nearby H3 rings and atomically offers the order to the first idle candidate.
-// It includes singleflight idempotency: concurrent duplicate requests for the same order ID
-// coalesce into a single matching operation, guaranteeing exactly one rider allocation.
+// It includes singleflight idempotency: duplicate requests coalesce into one matching operation.
 func (e *Engine) MatchOrder(order Order, maxK int, limit int) (*Rider, error) {
 	if maxK < 0 || limit <= 0 {
 		return nil, ErrNoRidersAvailable
@@ -89,7 +102,7 @@ func (e *Engine) MatchOrder(order Order, maxK int, limit int) (*Rider, error) {
 	e.orders[order.ID] = flight
 	e.ordersMu.Unlock()
 
-	// 2. Perform candidate search & CAS offer
+	// 2. Perform candidate search & CAS offer with active lease timer
 	matchedRider, err := e.searchAndOffer(order, maxK, limit)
 
 	// 3. Record outcome and wake any waiting duplicate requests
@@ -119,7 +132,12 @@ func (e *Engine) searchAndOffer(order Order, maxK int, limit int) (*Rider, error
 		return nil, ErrNoRidersAvailable
 	}
 
-	for _, riderID := range candidates {
+	return e.tryOfferCandidates(order, candidates, 0, maxK, limit)
+}
+
+func (e *Engine) tryOfferCandidates(order Order, candidates []string, startIndex int, maxK int, limit int) (*Rider, error) {
+	for i := startIndex; i < len(candidates); i++ {
+		riderID := candidates[i]
 		rider := e.GetRider(riderID)
 		if rider == nil {
 			continue
@@ -127,13 +145,109 @@ func (e *Engine) searchAndOffer(order Order, maxK int, limit int) (*Rider, error
 
 		// Atomic CAS: StateIdle -> StateOffered
 		if rider.TryOffer(order.ID) {
+			// Arm the active lease reaper timer
+			e.armOfferLease(order, rider.ID, candidates, i, maxK, limit)
 			return rider, nil
 		}
-		// If TryOffer returned false, rider was taken by another order or is busy.
-		// Cascades automatically to the next candidate!
 	}
 
 	return nil, ErrNoRidersAvailable
+}
+
+func (e *Engine) armOfferLease(order Order, riderID string, candidates []string, candIndex int, maxK int, limit int) {
+	e.offersMu.Lock()
+	defer e.offersMu.Unlock()
+
+	// Stop any pre-existing timer for this order
+	if existing, exists := e.offers[order.ID]; exists && existing.timer != nil {
+		existing.timer.Stop()
+	}
+
+	offer := &activeOffer{
+		order:      order,
+		riderID:    riderID,
+		candidates: candidates,
+		candIndex:  candIndex,
+		maxK:       maxK,
+		limit:      limit,
+	}
+
+	// Active deadline reaper
+	offer.timer = time.AfterFunc(e.offerTimeout, func() {
+		e.handleOfferTimeout(order.ID, riderID)
+	})
+
+	e.offers[order.ID] = offer
+}
+
+// handleOfferTimeout releases the timed-out rider and cascades to the next candidate.
+func (e *Engine) handleOfferTimeout(orderID uint64, riderID string) {
+	e.offersMu.Lock()
+	offer, exists := e.offers[orderID]
+	if !exists || offer.riderID != riderID {
+		e.offersMu.Unlock()
+		return
+	}
+	delete(e.offers, orderID)
+	e.offersMu.Unlock()
+
+	// 1. Release the timed-out rider back to StateIdle
+	rider := e.GetRider(riderID)
+	if rider != nil && rider.State() == StateOffered {
+		rider.Release()
+	}
+
+	// 2. Cascade to the next candidate
+	_, _ = e.tryOfferCandidates(offer.order, offer.candidates, offer.candIndex+1, offer.maxK, offer.limit)
+}
+
+// AcceptOrder records rider acceptance, transitioning StateOffered -> StateAssigned and disarming the reaper.
+func (e *Engine) AcceptOrder(riderID string, orderID uint64) bool {
+	rider := e.GetRider(riderID)
+	if rider == nil {
+		return false
+	}
+
+	if !rider.ConfirmAssign(orderID) {
+		return false
+	}
+
+	// Disarm active lease reaper
+	e.offersMu.Lock()
+	if offer, exists := e.offers[orderID]; exists && offer.riderID == riderID {
+		if offer.timer != nil {
+			offer.timer.Stop()
+		}
+		delete(e.offers, orderID)
+	}
+	e.offersMu.Unlock()
+
+	return true
+}
+
+// RejectOrder explicitly declines an offer, releasing the rider and cascading in 0ms without waiting for timeout.
+func (e *Engine) RejectOrder(riderID string, orderID uint64) bool {
+	e.offersMu.Lock()
+	offer, exists := e.offers[orderID]
+	if !exists || offer.riderID != riderID {
+		e.offersMu.Unlock()
+		return false
+	}
+	if offer.timer != nil {
+		offer.timer.Stop()
+	}
+	delete(e.offers, orderID)
+	e.offersMu.Unlock()
+
+	// 1. Release rider back to StateIdle immediately
+	rider := e.GetRider(riderID)
+	if rider != nil {
+		rider.Release()
+	}
+
+	// 2. Instant 0ms cascade to next candidate
+	_, _ = e.tryOfferCandidates(offer.order, offer.candidates, offer.candIndex+1, offer.maxK, offer.limit)
+	return true
 }
 
 // ClearOrder removes an order from the idempotency registry once delivered or cancelled.
@@ -141,15 +255,6 @@ func (e *Engine) ClearOrder(orderID uint64) {
 	e.ordersMu.Lock()
 	delete(e.orders, orderID)
 	e.ordersMu.Unlock()
-}
-
-// AcceptOrder records rider acceptance, transitioning StateOffered -> StateAssigned.
-func (e *Engine) AcceptOrder(riderID string, orderID uint64) bool {
-	rider := e.GetRider(riderID)
-	if rider == nil {
-		return false
-	}
-	return rider.ConfirmAssign(orderID)
 }
 
 // ReleaseRider resets a rider back to StateIdle if offer expires or delivery completes.

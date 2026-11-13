@@ -404,3 +404,138 @@ func TestEngine_DuplicateOrder_FailureEviction(t *testing.T) {
 		t.Fatalf("expected rider to be StateOffered, got %d", matched.State())
 	}
 }
+
+func TestEngine_OfferTimeout_AutoCascade(t *testing.T) {
+	cpLat := 28.6315
+	cpLng := 77.2167
+	cpCell := uint64(h3.FromGeo(h3.GeoCoord{Latitude: cpLat, Longitude: cpLng}, 8))
+
+	idx := spatial.NewSpatialIndex(64)
+	// Fast 30ms offer lease timeout for tests
+	engine := NewEngine(idx, 30*time.Millisecond)
+
+	riderA := NewRider("rider_A")
+	riderB := NewRider("rider_B")
+	engine.RegisterRider(riderA)
+	engine.RegisterRider(riderB)
+	idx.UpdatePosition("rider_A", cpCell, 1000)
+	idx.UpdatePosition("rider_B", cpCell, 1000)
+
+	order := Order{
+		ID:        777,
+		PickupLat: cpLat,
+		PickupLng: cpLng,
+	}
+
+	// 1. Initial match offers to first candidate returned by spatial index
+	matched, err := engine.MatchOrder(order, 1, 5)
+	if err != nil {
+		t.Fatalf("expected match to succeed, got: %v", err)
+	}
+
+	firstRider := riderA
+	secondRider := riderB
+	if matched.ID == "rider_B" {
+		firstRider = riderB
+		secondRider = riderA
+	}
+
+	if firstRider.State() != StateOffered {
+		t.Fatalf("expected first rider in StateOffered, got %d", firstRider.State())
+	}
+	if secondRider.State() != StateIdle {
+		t.Fatalf("expected second rider to initially remain StateIdle, got %d", secondRider.State())
+	}
+
+	// 2. First rider ignores phone. Wait 50ms for the 30ms active lease timer to expire
+	time.Sleep(50 * time.Millisecond)
+
+	// Invariant 1: First rider was auto-released back to StateIdle (No zombie locks!)
+	if firstRider.State() != StateIdle {
+		t.Fatalf("ZOMBIE LOCK: first rider should be released to StateIdle after timeout, got %d", firstRider.State())
+	}
+	if firstRider.AssignedOrderID() != 0 {
+		t.Fatalf("expected first rider order ID to reset to 0, got %d", firstRider.AssignedOrderID())
+	}
+
+	// Invariant 2: Engine auto-cascaded to second rider!
+	if secondRider.State() != StateOffered {
+		t.Fatalf("CASCADE FAILED: expected second rider to receive cascaded offer, got %d", secondRider.State())
+	}
+	if secondRider.AssignedOrderID() != 777 {
+		t.Fatalf("expected second rider to be offered order 777, got %d", secondRider.AssignedOrderID())
+	}
+
+	// 3. Second rider clicks Accept
+	if !engine.AcceptOrder(secondRider.ID, 777) {
+		t.Fatalf("expected second rider accept to succeed")
+	}
+
+	// Invariant 3: Second rider is now delivering
+	if secondRider.State() != StateAssigned {
+		t.Fatalf("expected second rider in StateAssigned, got %d", secondRider.State())
+	}
+}
+
+func TestEngine_ExplicitReject_InstantCascade(t *testing.T) {
+	cpLat := 28.6315
+	cpLng := 77.2167
+	cpCell := uint64(h3.FromGeo(h3.GeoCoord{Latitude: cpLat, Longitude: cpLng}, 8))
+
+	idx := spatial.NewSpatialIndex(64)
+	// 5-second timeout: prove that reject cascades in 0ms without waiting!
+	engine := NewEngine(idx, 5*time.Second)
+
+	riderA := NewRider("rider_A")
+	riderB := NewRider("rider_B")
+	engine.RegisterRider(riderA)
+	engine.RegisterRider(riderB)
+	idx.UpdatePosition("rider_A", cpCell, 1000)
+	idx.UpdatePosition("rider_B", cpCell, 1000)
+
+	order := Order{
+		ID:        888,
+		PickupLat: cpLat,
+		PickupLng: cpLng,
+	}
+
+	// 1. Initial match offers to first candidate
+	matched, err := engine.MatchOrder(order, 1, 5)
+	if err != nil {
+		t.Fatalf("expected match to succeed: %v", err)
+	}
+
+	firstRider := riderA
+	secondRider := riderB
+	if matched.ID == "rider_B" {
+		firstRider = riderB
+		secondRider = riderA
+	}
+
+	// 2. First rider explicitly taps "Reject"
+	start := time.Now()
+	rejected := engine.RejectOrder(firstRider.ID, 888)
+	elapsed := time.Since(start)
+
+	if !rejected {
+		t.Fatalf("expected RejectOrder to succeed")
+	}
+
+	// Invariant 1: 0ms instant turnaround (did not wait for 5s timeout)
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("REJECT DELAYED: expected 0ms cascade, took %v", elapsed)
+	}
+
+	// Invariant 2: First rider is immediately free back in StateIdle
+	if firstRider.State() != StateIdle {
+		t.Fatalf("expected first rider in StateIdle after reject, got %d", firstRider.State())
+	}
+
+	// Invariant 3: Second rider was instantly offered the order
+	if secondRider.State() != StateOffered {
+		t.Fatalf("expected second rider in StateOffered, got %d", secondRider.State())
+	}
+	if secondRider.AssignedOrderID() != 888 {
+		t.Fatalf("expected second rider assigned to 888, got %d", secondRider.AssignedOrderID())
+	}
+}

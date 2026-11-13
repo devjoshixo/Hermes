@@ -51,6 +51,7 @@ func (s *Server) routes() {
 	// Order dispatch endpoints
 	s.router.HandleFunc("POST /api/v1/orders", s.handleCreateOrder)
 	s.router.HandleFunc("POST /api/v1/orders/{order_id}/accept", s.handleAcceptOrder)
+	s.router.HandleFunc("POST /api/v1/orders/{order_id}/reject", s.handleRejectOrder)
 
 	// Health and telemetry
 	s.router.HandleFunc("GET /healthz", s.handleHealthz)
@@ -180,6 +181,48 @@ func (s *Server) handleAcceptOrder(w http.ResponseWriter, r *http.Request) {
 		"order_id": orderID,
 		"rider_id": riderID,
 		"status":   "ASSIGNED",
+	})
+}
+
+// handleRejectOrder handles explicit rider rejection, triggering instant 0ms cascade.
+func (s *Server) handleRejectOrder(w http.ResponseWriter, r *http.Request) {
+	orderIDStr := r.PathValue("order_id")
+	orderID, err := strconv.ParseUint(orderIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid order_id", http.StatusBadRequest)
+		return
+	}
+
+	riderID := r.URL.Query().Get("rider_id")
+	if riderID == "" {
+		var body struct {
+			RiderID string `json:"rider_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			riderID = body.RiderID
+		}
+	}
+
+	if riderID == "" {
+		http.Error(w, "missing rider_id", http.StatusBadRequest)
+		return
+	}
+
+	if !s.engine.RejectOrder(riderID, orderID) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "unable to reject order: state not offered or order mismatch",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"order_id": orderID,
+		"rider_id": riderID,
+		"status":   "REJECTED",
 	})
 }
 
