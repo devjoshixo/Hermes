@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/uber/h3-go/v3"
 )
@@ -21,16 +22,16 @@ func TestRiderMovement(t *testing.T) {
 	// Karol Bagh (Cell B)
 	cellB := uint64(h3.FromGeo(h3.GeoCoord{Latitude: 28.6517, Longitude: 77.1906}, 8))
 
-	// Step 1: Rider starts at Connaught Place (Cell A)
-	idx.UpdatePosition("rider_dev", cellA)
+	// Step 1: Rider starts at Connaught Place (Cell A) at t=1000
+	idx.UpdatePosition("rider_dev", cellA, 1000)
 
 	ridersInA := idx.GetRidersInCell(cellA)
 	if len(ridersInA) != 1 || ridersInA[0] != "rider_dev" {
 		t.Fatalf("expected [rider_dev] in Cell A, got: %v", ridersInA)
 	}
 
-	// Step 2: Rider drives to Karol Bagh (Cell B)
-	idx.UpdatePosition("rider_dev", cellB)
+	// Step 2: Rider drives to Karol Bagh (Cell B) at t=2000
+	idx.UpdatePosition("rider_dev", cellB, 2000)
 
 	// Check Karol Bagh (Cell B): Must be there!
 	ridersInB := idx.GetRidersInCell(cellB)
@@ -67,9 +68,9 @@ func TestSpatialIndex_FindNearby(t *testing.T) {
 	}
 
 	// Case 2: Put 1 rider in center, 2 in neighbor ring
-	idx.UpdatePosition("rider_center", origin)
-	idx.UpdatePosition("rider_near_1", neighborCell1)
-	idx.UpdatePosition("rider_near_2", neighborCell2)
+	idx.UpdatePosition("rider_center", origin, 1000)
+	idx.UpdatePosition("rider_near_1", neighborCell1, 1000)
+	idx.UpdatePosition("rider_near_2", neighborCell2, 1000)
 
 	// Search ONLY Ring 0 (maxK = 0)
 	centerOnly := idx.FindNearby(origin, 0, 10)
@@ -84,16 +85,100 @@ func TestSpatialIndex_FindNearby(t *testing.T) {
 	}
 }
 
+// TestSpatialIndex_TimestampFencing proves that out-of-order stale GPS pings are dropped.
+func TestSpatialIndex_TimestampFencing(t *testing.T) {
+	idx := NewSpatialIndex(64)
+
+	cellA := uint64(h3.FromGeo(h3.GeoCoord{Latitude: 28.6315, Longitude: 77.2167}, 8)) // CP
+	cellB := uint64(h3.FromGeo(h3.GeoCoord{Latitude: 28.6517, Longitude: 77.1906}, 8)) // Karol Bagh
+
+	// 1. Initial position at t = 1000 in Cell A
+	if !idx.UpdatePosition("rider_speedy", cellA, 1000) {
+		t.Fatalf("expected initial position update to succeed")
+	}
+
+	// 2. Delayed out-of-order ping arrives from past: t = 500 claiming rider is in Cell B
+	accepted := idx.UpdatePosition("rider_speedy", cellB, 500)
+	if accepted {
+		t.Fatalf("STALE PING ACCEPTED: expected timestamp 500 to be rejected when current is 1000")
+	}
+
+	// Invariant: Rider must STILL be in Cell A, and NOT in Cell B
+	cell, exists := idx.GetRiderCell("rider_speedy")
+	if !exists || cell != cellA {
+		t.Fatalf("rider moved incorrectly to stale cell: %d", cell)
+	}
+	if len(idx.GetRidersInCell(cellB)) != 0 {
+		t.Fatalf("stale ping created ghost rider in Cell B!")
+	}
+
+	// 3. Newer ping arrives: t = 2000 moving rider to Cell B
+	if !idx.UpdatePosition("rider_speedy", cellB, 2000) {
+		t.Fatalf("expected newer ping t=2000 to be accepted")
+	}
+
+	cell, exists = idx.GetRiderCell("rider_speedy")
+	if !exists || cell != cellB {
+		t.Fatalf("expected rider to be in Cell B, got: %d", cell)
+	}
+}
+
+// TestSpatialIndex_GhostRider_InterleavedStampede fires 20 concurrent goroutines
+// updating the location of the EXACT SAME rider to eliminate the ghost rider race condition.
+func TestSpatialIndex_GhostRider_InterleavedStampede(t *testing.T) {
+	idx := NewSpatialIndex(64)
+	origin := uint64(h3.FromGeo(h3.GeoCoord{Latitude: 28.6315, Longitude: 77.2167}, 8))
+	sampleCellsRaw := h3.KRing(h3.H3Index(origin), 3)
+
+	const totalUpdates = 200
+	var wg sync.WaitGroup
+	startGun := make(chan struct{})
+
+	// 20 workers racing to update the exact same rider's location concurrently
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-startGun
+
+			for j := 0; j < 10; j++ {
+				// Guaranteed monotonically increasing timestamps across iterations
+				ts := time.Now().UnixNano()
+				targetCell := uint64(sampleCellsRaw[rand.Intn(len(sampleCellsRaw))])
+				idx.UpdatePosition("rider_contested", targetCell, ts)
+			}
+		}(i)
+	}
+
+	close(startGun)
+	wg.Wait()
+
+	// INVARIANT AUDIT: Rider must exist in EXACTLY ONE cell across the entire spatial index!
+	var cellOccurrences []uint64
+	for _, rawCell := range sampleCellsRaw {
+		cellID := uint64(rawCell)
+		riders := idx.GetRidersInCell(cellID)
+		for _, r := range riders {
+			if r == "rider_contested" {
+				cellOccurrences = append(cellOccurrences, cellID)
+			}
+		}
+	}
+
+	if len(cellOccurrences) > 1 {
+		t.Fatalf("GHOST RIDER DETECTED: rider_contested was found in %d cells simultaneously: %v",
+			len(cellOccurrences), cellOccurrences)
+	}
+	if len(cellOccurrences) == 0 {
+		t.Fatalf("VOID VANISHING: rider_contested vanished from all cells!")
+	}
+}
+
 // TestSpatialIndex_ConcurrentStampede fires 50 writers and 20 readers simultaneously.
-// Ran with 'go test -race' to verify that lock-striping prevents:
-// 1. Data races (concurrent map read/write panics)
-// 2. Deadlocks between shards
-// 3. Lost rider updates
 func TestSpatialIndex_ConcurrentStampede(t *testing.T) {
 	idx := NewSpatialIndex(64)
 	origin := uint64(h3.FromGeo(h3.GeoCoord{Latitude: 28.6315, Longitude: 77.2167}, 8))
 
-	// Get 37 hexagons around Delhi as our testing playground
 	sampleCellsRaw := h3.KRing(h3.H3Index(origin), 3)
 	sampleCells := make([]uint64, len(sampleCellsRaw))
 	for i, c := range sampleCellsRaw {
@@ -112,7 +197,7 @@ func TestSpatialIndex_ConcurrentStampede(t *testing.T) {
 			for {
 				select {
 				case <-stopSignal:
-					return // stop when told to
+					return
 				default:
 					randomOrigin := sampleCells[rand.Intn(len(sampleCells))]
 					_ = idx.FindNearby(randomOrigin, 2, 5)
@@ -129,24 +214,21 @@ func TestSpatialIndex_ConcurrentStampede(t *testing.T) {
 			for i := 0; i < 50; i++ {
 				riderID := fmt.Sprintf("rider_%d_%d", writerID, i%10)
 				randomCell := sampleCells[rand.Intn(len(sampleCells))]
-				idx.UpdatePosition(riderID, randomCell)
+				idx.UpdatePosition(riderID, randomCell, time.Now().UnixNano())
 			}
 		}(w)
 	}
 
-	// Wait for all 50 writers to finish their 2,500 updates
 	writersWg.Wait()
-
-	// Stop all readers and wait for them to finish
 	close(stopSignal)
 	readersWg.Wait()
 
-	// 3. Final Invariant Audit: Did any rider get lost or corrupted?
+	// 3. Final Invariant Audit
 	idx.riderMu.RLock()
 	defer idx.riderMu.RUnlock()
 
-	for riderID, cellID := range idx.riderToCell {
-		ridersInCell := idx.GetRidersInCell(cellID)
+	for riderID, loc := range idx.riderToLocation {
+		ridersInCell := idx.GetRidersInCell(loc.cell)
 		found := false
 		for _, r := range ridersInCell {
 			if r == riderID {
@@ -155,7 +237,7 @@ func TestSpatialIndex_ConcurrentStampede(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("Invariant broken! Rider %s is in notebook for cell %d, but missing in shard!", riderID, cellID)
+			t.Fatalf("Invariant broken! Rider %s is in notebook for cell %d, but missing in shard!", riderID, loc.cell)
 		}
 	}
 }

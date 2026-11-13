@@ -25,7 +25,7 @@ func TestEngine_MatchAndAccept(t *testing.T) {
 	// 2. Register Rider and place them in the spatial index
 	rider := NewRider("rider_cp")
 	engine.RegisterRider(rider)
-	idx.UpdatePosition("rider_cp", cpCell)
+	idx.UpdatePosition("rider_cp", cpCell, 1000)
 
 	// Invariant 0: Rider must start Idle with order ID 0
 	if rider.State() != StateIdle {
@@ -87,8 +87,8 @@ func TestEngine_AutoCascade(t *testing.T) {
 	riderB := NewRider("rider_B")
 	engine.RegisterRider(riderA)
 	engine.RegisterRider(riderB)
-	idx.UpdatePosition("rider_A", cpCell)
-	idx.UpdatePosition("rider_B", cpCell)
+	idx.UpdatePosition("rider_A", cpCell, 1000)
+	idx.UpdatePosition("rider_B", cpCell, 1000)
 
 	// Precondition: Rider A is already busy / offered Order #1
 	if !riderA.TryOffer(1) {
@@ -138,7 +138,7 @@ func TestEngine_ThunderingHerd_50Orders_1Rider(t *testing.T) {
 	// 1 single rider available at Connaught Place
 	soloRider := NewRider("rider_solo")
 	engine.RegisterRider(soloRider)
-	idx.UpdatePosition("rider_solo", cpCell)
+	idx.UpdatePosition("rider_solo", cpCell, 1000)
 
 	const totalOrders = 50
 	var winCount int64
@@ -211,7 +211,7 @@ func TestEngine_ScaleConcurrency_50Orders_50Riders(t *testing.T) {
 		r := NewRider(rID)
 		riders[i] = r
 		engine.RegisterRider(r)
-		idx.UpdatePosition(rID, cpCell)
+		idx.UpdatePosition(rID, cpCell, 1000)
 	}
 
 	var (
@@ -298,8 +298,8 @@ func TestEngine_DuplicateOrder_Singleflight(t *testing.T) {
 	riderB := NewRider("rider_B")
 	engine.RegisterRider(riderA)
 	engine.RegisterRider(riderB)
-	idx.UpdatePosition("rider_A", cpCell)
-	idx.UpdatePosition("rider_B", cpCell)
+	idx.UpdatePosition("rider_A", cpCell, 1000)
+	idx.UpdatePosition("rider_B", cpCell, 1000)
 
 	const duplicateRequests = 20
 	const targetOrderID = uint64(999)
@@ -389,7 +389,7 @@ func TestEngine_DuplicateOrder_FailureEviction(t *testing.T) {
 	// 2. Rider logs on 2 seconds later at Connaught Place
 	newRider := NewRider("rider_arrived_late")
 	engine.RegisterRider(newRider)
-	idx.UpdatePosition("rider_arrived_late", cpCell)
+	idx.UpdatePosition("rider_arrived_late", cpCell, 2000)
 
 	// 3. User retries the same order -> must succeed (failure was evicted, not frozen)
 	matched, err := engine.MatchOrder(order, 1, 5)

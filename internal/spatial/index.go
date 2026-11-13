@@ -15,15 +15,21 @@ type Shard struct {
 	cells map[uint64]CellSet // H3 CellID -> Set of Rider IDs
 }
 
+// riderLocation stores the rider's latest known H3 cell and timestamp.
+type riderLocation struct {
+	cell      uint64
+	timestamp int64
+}
+
 // SpatialIndex is a lock-striped in-memory spatial index.
 type SpatialIndex struct {
 	numShards uint64
 	mask      uint64
 	shards    []*Shard
 
-	// riderMu guards riderToCell to track each rider's current location in O(1)
-	riderMu     sync.RWMutex
-	riderToCell map[string]uint64 // RiderID -> Current H3 CellID
+	// riderMu guards riderToLocation to track each rider's current location and timestamp in O(1)
+	riderMu         sync.RWMutex
+	riderToLocation map[string]riderLocation // RiderID -> Current H3 CellID & Timestamp
 }
 
 // NewSpatialIndex initializes a spatial index with a power-of-2 number of shards (default 64).
@@ -34,10 +40,10 @@ func NewSpatialIndex(numShards int) *SpatialIndex {
 
 	n := uint64(numShards)
 	idx := &SpatialIndex{
-		numShards:   n,
-		mask:        n - 1,
-		shards:      make([]*Shard, n),
-		riderToCell: make(map[string]uint64),
+		numShards:       n,
+		mask:            n - 1,
+		shards:          make([]*Shard, n),
+		riderToLocation: make(map[string]riderLocation),
 	}
 
 	for i := uint64(0); i < n; i++ {
@@ -107,34 +113,38 @@ func (idx *SpatialIndex) FindNearby(originCell uint64, maxK int, limit int) []st
 
 // UpdatePosition atomically moves a rider from their old cell to newCell.
 // CONTRACT:
-// 1. Must satisfy Invariant 1: No Ghost Duplicates.
+// 1. Must satisfy Invariant 1: No Ghost Duplicates (atomic transfer across shards).
 // 2. Must satisfy Invariant 2: No Void Vanishing.
-// 3. If oldCell == newCell, it is a no-op (return early).
-func (idx *SpatialIndex) UpdatePosition(riderID string, newCell uint64) {
+// 3. Stale pings (timestamp <= latest known timestamp) are dropped immediately.
+// 4. If oldCell == newCell, only the timestamp is updated (0 shard work).
+func (idx *SpatialIndex) UpdatePosition(riderID string, newCell uint64, timestamp int64) bool {
 	idx.riderMu.Lock()
-	oldCell, exists := idx.riderToCell[riderID]
+	defer idx.riderMu.Unlock()
 
-	// Case 1: Rider stayed in the exact same hexagon -> 0 work to do
-	if exists && oldCell == newCell {
-		idx.riderMu.Unlock()
-		return
+	loc, exists := idx.riderToLocation[riderID]
+
+	// Case 1: Out-of-order stale ping check (Timestamp Fencing)
+	if exists && timestamp <= loc.timestamp {
+		return false // Stale ping dropped
 	}
 
-	// Update the notebook
-	idx.riderToCell[riderID] = newCell
-	idx.riderMu.Unlock()
+	// Case 2: Rider stayed in the exact same hexagon -> update timestamp only
+	if exists && loc.cell == newCell {
+		idx.riderToLocation[riderID] = riderLocation{cell: newCell, timestamp: timestamp}
+		return true
+	}
 
-	// Case 2: Rider was previously in an old cell -> remove them from old shard
+	// Case 3: Remove rider from old shard
 	if exists {
-		oldShard := idx.getShard(oldCell)
+		oldShard := idx.getShard(loc.cell)
 		oldShard.mu.Lock()
-		if set, ok := oldShard.cells[oldCell]; ok {
+		if set, ok := oldShard.cells[loc.cell]; ok {
 			delete(set, riderID)
 		}
 		oldShard.mu.Unlock()
 	}
 
-	// Case 3: Put rider into the new cell's shard
+	// Case 4: Put rider into new shard
 	newShard := idx.getShard(newCell)
 	newShard.mu.Lock()
 	if newShard.cells[newCell] == nil {
@@ -142,23 +152,35 @@ func (idx *SpatialIndex) UpdatePosition(riderID string, newCell uint64) {
 	}
 	newShard.cells[newCell][riderID] = struct{}{}
 	newShard.mu.Unlock()
+
+	// Case 5: Update notebook
+	idx.riderToLocation[riderID] = riderLocation{cell: newCell, timestamp: timestamp}
+	return true
 }
 
 // Remove completely deletes a rider from the index when they disconnect.
 func (idx *SpatialIndex) Remove(riderID string) {
 	idx.riderMu.Lock()
-	oldCell, exists := idx.riderToCell[riderID]
+	defer idx.riderMu.Unlock()
+
+	loc, exists := idx.riderToLocation[riderID]
 	if !exists {
-		idx.riderMu.Unlock()
 		return
 	}
-	delete(idx.riderToCell, riderID)
-	idx.riderMu.Unlock()
+	delete(idx.riderToLocation, riderID)
 
-	oldShard := idx.getShard(oldCell)
+	oldShard := idx.getShard(loc.cell)
 	oldShard.mu.Lock()
-	if set, ok := oldShard.cells[oldCell]; ok {
+	if set, ok := oldShard.cells[loc.cell]; ok {
 		delete(set, riderID)
 	}
 	oldShard.mu.Unlock()
+}
+
+// GetRiderCell returns the current cell of the rider if present.
+func (idx *SpatialIndex) GetRiderCell(riderID string) (uint64, bool) {
+	idx.riderMu.RLock()
+	defer idx.riderMu.RUnlock()
+	loc, exists := idx.riderToLocation[riderID]
+	return loc.cell, exists
 }

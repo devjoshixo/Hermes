@@ -66,7 +66,7 @@ func (p *Pipeline) worker() {
 		}
 		cell := uint64(h3.FromGeo(coord, p.resolution))
 
-		p.index.UpdatePosition(ping.RiderID, cell)
+		p.index.UpdatePosition(ping.RiderID, cell, ping.Timestamp)
 		atomic.AddUint64(&p.stats.processed, 1)
 	}
 }
