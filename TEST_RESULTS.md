@@ -103,7 +103,34 @@ This document records the exact numerical measurements, concurrency proofs, and 
 
 ---
 
-## 5. Verification Command
+## 5. Milestone 4: Hardening, Offer Lifecycle & The Swiggy Async Flow
+
+### A. Singleflight Order Deduplication (`TestEngine_DuplicateOrder_Singleflight`)
+- **Scenario:** 20 concurrent duplicate requests hit `Engine.MatchOrder` for the same Order ID simultaneously under a thundering herd.
+- **In-Flight Coalescing:** All 20 requests coalesce into **exactly 1 dispatch execution**; all 20 receive the same matched rider.
+- **Supply Conservation:** Adjacent idle riders in the same cell remain 100% unallocated (`StateIdle`, assigned order ID = 0).
+- **Failure Eviction:** If matching fails due to 0 supply, failures are evicted so subsequent retries after supply arrives succeed immediately (`TestEngine_DuplicateOrder_FailureEviction`).
+
+### B. Ghost Rider Elimination & Timestamp Fencing (`TestSpatialIndex_GhostRider_InterleavedStampede`)
+- **Scenario:** 20 concurrent workers thrashing `UpdatePosition` on the exact same moving rider across adjacent H3 cells.
+- **Atomic Transfer Hierarchy:** Strict `riderMu` $\rightarrow$ `shard.mu` locking prevents interleaved partition reads.
+- **Ghost Duplicates:** **0** (Rider never exists in $>1$ cell).
+- **Void Vanishings:** **0** (Rider never temporarily disappears from spatial memory).
+- **Timestamp Fencing:** Telemetry with timestamp $T_{new} \le T_{current}$ is dropped instantly, ignoring out-of-order mobile GPS packets (`TestSpatialIndex_TimestampFencing`).
+
+### C. Active 15s Lease Reaper & 0ms Explicit Rejection (`TestEngine_OfferTimeout_AutoCascade`)
+- **Active Reaper:** `time.AfterFunc` fires after lease duration, releasing timed-out rider back to `StateIdle` and cascading offer to candidate #2.
+- **0ms Instant Cascade:** If candidate rider explicitly rejects (`POST /api/v1/orders/{order_id}/reject`), lease timer is cancelled and cascade occurs immediately without waiting for timeout (`TestEngine_ExplicitReject_InstantCascade`).
+
+### D. The Swiggy Async Flow & Polling (`TestServer_AsyncSwiggyFlow_FullRejectionAndExhaustion`)
+- **Latency Optimization:** `POST /api/v1/orders` returns `202 Accepted` immediately (<2ms) with `{"status": "SEARCHING"}` and moves matching to background.
+- **Zero-Race Polling:** Order flight is initialized synchronously before `202 Accepted` is returned, guaranteeing immediate subsequent polling (`GET /api/v1/orders/{order_id}`) never returns 404.
+- **Live State Machine:** Polling accurately observes live state transitions (`SEARCHING` $\rightarrow$ `OFFERED` $\rightarrow$ `ASSIGNED` or `EXHAUSTED`).
+- **Data Races Detected:** **0** under `go test -race`.
+
+---
+
+## 6. Verification Command
 To reproduce all numbers and proofs in a single pass without caching:
 
 ```bash

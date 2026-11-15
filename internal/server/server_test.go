@@ -80,9 +80,9 @@ func TestServer_EndToEnd_Lifecycle(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		respBody, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(respBody))
+		t.Fatalf("expected 202 Accepted, got %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var orderResp CreateOrderResponse
@@ -90,12 +90,31 @@ func TestServer_EndToEnd_Lifecycle(t *testing.T) {
 		t.Fatalf("failed to decode order response: %v", err)
 	}
 
-	// Invariant 2: Matched rider is rider_live_1 in OFFERED status
-	if orderResp.RiderID != "rider_live_1" {
-		t.Fatalf("expected matched rider rider_live_1, got %s", orderResp.RiderID)
+	if orderResp.Status != matching.OrderStatusSearching {
+		t.Fatalf("expected status SEARCHING on 202 Accepted, got %s", orderResp.Status)
 	}
-	if orderResp.Status != "OFFERED" {
-		t.Fatalf("expected status OFFERED, got %s", orderResp.Status)
+
+	// Poll GET /api/v1/orders/101 until status becomes OFFERED
+	var pollResp CreateOrderResponse
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		getResp, err := http.Get(ts.URL + "/api/v1/orders/101")
+		if err == nil && getResp.StatusCode == http.StatusOK {
+			_ = json.NewDecoder(getResp.Body).Decode(&pollResp)
+			getResp.Body.Close()
+			if pollResp.Status == matching.OrderStatusOffered {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Invariant 2: Matched rider is rider_live_1 in OFFERED status
+	if pollResp.RiderID != "rider_live_1" {
+		t.Fatalf("expected matched rider rider_live_1, got %s", pollResp.RiderID)
+	}
+	if pollResp.Status != matching.OrderStatusOffered {
+		t.Fatalf("expected status OFFERED, got %s", pollResp.Status)
 	}
 	if r.State() != matching.StateOffered {
 		t.Fatalf("expected rider in StateOffered, got %d", r.State())
@@ -120,6 +139,18 @@ func TestServer_EndToEnd_Lifecycle(t *testing.T) {
 	}
 	if r.AssignedOrderID() != 101 {
 		t.Fatalf("expected assigned order ID 101, got %d", r.AssignedOrderID())
+	}
+
+	// Invariant 3b: Polling GET /api/v1/orders/101 reflects ASSIGNED status
+	getAssignedResp, err := http.Get(ts.URL + "/api/v1/orders/101")
+	if err != nil || getAssignedResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET /orders/101 after accept, got err=%v", err)
+	}
+	var assignedOrderResp CreateOrderResponse
+	_ = json.NewDecoder(getAssignedResp.Body).Decode(&assignedOrderResp)
+	getAssignedResp.Body.Close()
+	if assignedOrderResp.Status != matching.OrderStatusAssigned || assignedOrderResp.RiderID != "rider_live_1" {
+		t.Fatalf("expected status ASSIGNED and rider_live_1, got %s and %s", assignedOrderResp.Status, assignedOrderResp.RiderID)
 	}
 
 	// 7. Rider app disconnects (socket closes)
@@ -225,13 +256,24 @@ func TestServer_Concurrent_GPSAndOrders(t *testing.T) {
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				var rResp CreateOrderResponse
-				if err := json.NewDecoder(resp.Body).Decode(&rResp); err == nil {
-					mu.Lock()
-					matchedRiders[rResp.RiderID] = true
-					successCount++
-					mu.Unlock()
+			if resp.StatusCode == http.StatusAccepted {
+				// Poll until matched or timeout
+				deadline := time.Now().Add(500 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					gResp, err := http.Get(fmt.Sprintf("%s/api/v1/orders/%d", ts.URL, oID))
+					if err == nil && gResp.StatusCode == http.StatusOK {
+						var rResp CreateOrderResponse
+						_ = json.NewDecoder(gResp.Body).Decode(&rResp)
+						gResp.Body.Close()
+						if rResp.Status == matching.OrderStatusOffered && rResp.RiderID != "" {
+							mu.Lock()
+							matchedRiders[rResp.RiderID] = true
+							successCount++
+							mu.Unlock()
+							break
+						}
+					}
+					time.Sleep(5 * time.Millisecond)
 				}
 			}
 		}(orderID)
@@ -249,5 +291,71 @@ func TestServer_Concurrent_GPSAndOrders(t *testing.T) {
 	// Invariant 2: 10 unique riders matched (Zero double-booking)
 	if len(matchedRiders) != riderCount {
 		t.Fatalf("expected %d unique matched riders, got %d", riderCount, len(matchedRiders))
+	}
+}
+
+func TestServer_AsyncSwiggyFlow_FullRejectionAndExhaustion(t *testing.T) {
+	cpLat := 28.6315
+	cpLng := 77.2167
+
+	spatialIndex := spatial.NewSpatialIndex(64)
+	pipeline := ingest.NewPipeline(spatialIndex, 100, 2, 8)
+	defer pipeline.Stop()
+
+	engine := matching.NewEngine(spatialIndex, 5*time.Second)
+	srv := NewServer(spatialIndex, pipeline, engine)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// 1. Query non-existent order -> 404 Not Found
+	respNotFound, err := http.Get(ts.URL + "/api/v1/orders/999999")
+	if err != nil {
+		t.Fatalf("get request failed: %v", err)
+	}
+	respNotFound.Body.Close()
+	if respNotFound.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown order, got %d", respNotFound.StatusCode)
+	}
+
+	// 2. Post order with 0 riders available -> 202 Accepted immediately
+	orderReq := CreateOrderRequest{
+		OrderID:   555,
+		PickupLat: cpLat,
+		PickupLng: cpLng,
+		MaxK:      1,
+		Limit:     5,
+	}
+	body, _ := json.Marshal(orderReq)
+	postResp, err := http.Post(ts.URL+"/api/v1/orders", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post order failed: %v", err)
+	}
+	defer postResp.Body.Close()
+
+	if postResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d", postResp.StatusCode)
+	}
+
+	// 3. Poll GET /api/v1/orders/555 -> transitions to EXHAUSTED
+	var pollResp CreateOrderResponse
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		getResp, err := http.Get(ts.URL + "/api/v1/orders/555")
+		if err == nil && getResp.StatusCode == http.StatusOK {
+			_ = json.NewDecoder(getResp.Body).Decode(&pollResp)
+			getResp.Body.Close()
+			if pollResp.Status == matching.OrderStatusExhausted {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if pollResp.Status != matching.OrderStatusExhausted {
+		t.Fatalf("expected order status EXHAUSTED, got %s", pollResp.Status)
+	}
+	if pollResp.RiderID != "" {
+		t.Fatalf("expected empty rider ID on EXHAUSTED, got %s", pollResp.RiderID)
 	}
 }

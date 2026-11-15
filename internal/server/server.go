@@ -50,6 +50,7 @@ func (s *Server) routes() {
 
 	// Order dispatch endpoints
 	s.router.HandleFunc("POST /api/v1/orders", s.handleCreateOrder)
+	s.router.HandleFunc("GET /api/v1/orders/{order_id}", s.handleGetOrderStatus)
 	s.router.HandleFunc("POST /api/v1/orders/{order_id}/accept", s.handleAcceptOrder)
 	s.router.HandleFunc("POST /api/v1/orders/{order_id}/reject", s.handleRejectOrder)
 
@@ -96,7 +97,7 @@ type CreateOrderResponse struct {
 	Status  string `json:"status"`
 }
 
-// handleCreateOrder processes an incoming order and attempts atomic dispatch.
+// handleCreateOrder processes an incoming order asynchronously and returns 202 Accepted.
 func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	var req CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -119,13 +120,34 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		PickupLng: req.PickupLng,
 	}
 
-	matchedRider, err := s.engine.MatchOrder(order, maxK, limit)
+	// 1. Kick off asynchronous match (registers OrderStatusSearching synchronously, executes search in background)
+	s.engine.MatchOrderAsync(order, maxK, limit)
+
+	// 2. Respond immediately with 202 Accepted
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(CreateOrderResponse{
+		OrderID: req.OrderID,
+		Status:  matching.OrderStatusSearching,
+	})
+}
+
+// handleGetOrderStatus retrieves the live dispatch status of an order.
+func (s *Server) handleGetOrderStatus(w http.ResponseWriter, r *http.Request) {
+	orderIDStr := r.PathValue("order_id")
+	orderID, err := strconv.ParseUint(orderIDStr, 10, 64)
 	if err != nil {
-		if errors.Is(err, matching.ErrNoRidersAvailable) {
+		http.Error(w, "invalid order_id", http.StatusBadRequest)
+		return
+	}
+
+	status, riderID, err := s.engine.GetOrderStatus(orderID)
+	if err != nil {
+		if errors.Is(err, matching.ErrOrderNotFound) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "no riders available nearby",
+				"error": "order not found",
 			})
 			return
 		}
@@ -136,9 +158,9 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(CreateOrderResponse{
-		OrderID: req.OrderID,
-		RiderID: matchedRider.ID,
-		Status:  "OFFERED",
+		OrderID: orderID,
+		RiderID: riderID,
+		Status:  status,
 	})
 }
 

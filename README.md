@@ -52,9 +52,12 @@
   - Scale Concurrency: 50 orders vs 50 riders in the same cell at the exact same microsecond $\rightarrow$ 1:1 bipartite matching, 0 double-bookings, 0 split-brain states, 0 data races.
   - Full End-to-End Test: Live WebSocket GPS streaming while concurrent orders fire and match in sub-100ms.
 
-### Milestone 4: Offer Lifecycle, Timeouts & Cascades
-- 15-second acceptance window with active deadline reaping via `time.Timer`.
-- Multi-ring candidate exhaustion circuit breakers (`503 No Riders Available`).
+### Milestone 4: Hardening, Offer Lifecycle & The Swiggy Async Flow (Complete)
+- **Singleflight Order Deduplication:** Coalesces duplicate customer order submissions into a single in-flight dispatch using `orderFlight` channels, preventing duplicate allocations and ghost rider claims under network retry storms.
+- **Ghost Rider Elimination & Timestamp Fencing:** Atomic cell migration holding `riderMu` throughout shard transfers (`riderMu` -> `shard.mu` strict lock hierarchy) eliminates ghost duplicate entries or void disappearance during rapid movement. Timestamp fencing discards stale, out-of-order GPS telemetry ($T_{new} \le T_{current}$).
+- **15-Second Active Offer Lease Reaper & Auto-Cascade:** Auto-cascades expired offers to subsequent candidate riders via active `time.AfterFunc` deadline reapers.
+- **0ms Explicit Rejection:** Instantaneous offer cascade when a rider explicitly declines an order without waiting for timeout leases.
+- **The Swiggy Async Flow:** Decoupled `POST /api/v1/orders` returning `202 Accepted` in <2ms and executing background matching, paired with `GET /api/v1/orders/{order_id}` live status polling (`SEARCHING` -> `OFFERED` -> `ASSIGNED` / `EXHAUSTED`). Verified under `-race`.
 
 ### Milestone 5: Multi-Node Deployment & Chaos Testing
 - Multi-replica state synchronization using Redis Pub/Sub.

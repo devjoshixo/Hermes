@@ -14,13 +14,25 @@ var (
 	ErrNoRidersAvailable = errors.New("no riders available nearby")
 	// ErrRiderNotFound is returned when a rider ID is not registered.
 	ErrRiderNotFound = errors.New("rider not found")
+	// ErrOrderNotFound is returned when an order ID is not present in the order registry.
+	ErrOrderNotFound = errors.New("order not found")
+)
+
+// Order status constants tracking the lifecycle of an order.
+const (
+	OrderStatusSearching = "SEARCHING"
+	OrderStatusOffered   = "OFFERED"
+	OrderStatusAssigned  = "ASSIGNED"
+	OrderStatusExhausted = "EXHAUSTED"
 )
 
 // orderFlight tracks an in-flight or completed order matching operation.
 type orderFlight struct {
-	done  chan struct{}
-	rider *Rider
-	err   error
+	status  string
+	riderID string
+	done    chan struct{}
+	rider   *Rider
+	err     error
 }
 
 // activeOffer tracks an offered order lease with its deadline timer and candidate cascade list.
@@ -83,41 +95,65 @@ func (e *Engine) GetRider(riderID string) *Rider {
 	return e.riders[riderID]
 }
 
-// MatchOrder searches nearby H3 rings and atomically offers the order to the first idle candidate.
-// It includes singleflight idempotency: duplicate requests coalesce into one matching operation.
-func (e *Engine) MatchOrder(order Order, maxK int, limit int) (*Rider, error) {
+// MatchOrderAsync registers the order synchronously in OrderStatusSearching and runs the candidate
+// search and atomic offer asynchronously in the background.
+func (e *Engine) MatchOrderAsync(order Order, maxK int, limit int) *orderFlight {
 	if maxK < 0 || limit <= 0 {
-		return nil, ErrNoRidersAvailable
+		flight := &orderFlight{
+			status: OrderStatusExhausted,
+			done:   make(chan struct{}),
+			err:    ErrNoRidersAvailable,
+		}
+		close(flight.done)
+		return flight
 	}
 
 	// 1. Idempotency & In-Flight Coalescing
 	e.ordersMu.Lock()
 	if flight, exists := e.orders[order.ID]; exists {
-		e.ordersMu.Unlock()
-		<-flight.done // Wait for in-flight match to complete
-		return flight.rider, flight.err
+		// If previously exhausted, allow retry by resetting the flight
+		if flight.status != OrderStatusExhausted {
+			e.ordersMu.Unlock()
+			return flight
+		}
 	}
 
-	flight := &orderFlight{done: make(chan struct{})}
+	flight := &orderFlight{
+		status: OrderStatusSearching,
+		done:   make(chan struct{}),
+	}
 	e.orders[order.ID] = flight
 	e.ordersMu.Unlock()
 
-	// 2. Perform candidate search & CAS offer with active lease timer
-	matchedRider, err := e.searchAndOffer(order, maxK, limit)
+	// 2. Perform candidate search & CAS offer asynchronously
+	go func() {
+		matchedRider, err := e.searchAndOffer(order, maxK, limit)
 
-	// 3. Record outcome and wake any waiting duplicate requests
-	flight.rider = matchedRider
-	flight.err = err
-	close(flight.done)
-
-	// 4. Failure eviction: do not freeze failures into memory so future retries can succeed
-	if err != nil {
 		e.ordersMu.Lock()
-		delete(e.orders, order.ID)
+		flight.rider = matchedRider
+		flight.err = err
+		if err != nil {
+			flight.status = OrderStatusExhausted
+			flight.riderID = ""
+		} else {
+			flight.status = OrderStatusOffered
+			flight.riderID = matchedRider.ID
+		}
+		close(flight.done)
 		e.ordersMu.Unlock()
-	}
+	}()
 
-	return matchedRider, err
+	return flight
+}
+
+// MatchOrder searches nearby H3 rings and atomically offers the order to the first idle candidate.
+// It delegates to MatchOrderAsync and waits for the in-flight matching operation to complete.
+func (e *Engine) MatchOrder(order Order, maxK int, limit int) (*Rider, error) {
+	flight := e.MatchOrderAsync(order, maxK, limit)
+	<-flight.done
+	e.ordersMu.Lock()
+	defer e.ordersMu.Unlock()
+	return flight.rider, flight.err
 }
 
 func (e *Engine) searchAndOffer(order Order, maxK int, limit int) (*Rider, error) {
@@ -198,7 +234,20 @@ func (e *Engine) handleOfferTimeout(orderID uint64, riderID string) {
 	}
 
 	// 2. Cascade to the next candidate
-	_, _ = e.tryOfferCandidates(offer.order, offer.candidates, offer.candIndex+1, offer.maxK, offer.limit)
+	nextRider, err := e.tryOfferCandidates(offer.order, offer.candidates, offer.candIndex+1, offer.maxK, offer.limit)
+	e.ordersMu.Lock()
+	if flight, exists := e.orders[orderID]; exists {
+		if err != nil {
+			flight.status = OrderStatusExhausted
+			flight.riderID = ""
+			flight.rider = nil
+		} else {
+			flight.status = OrderStatusOffered
+			flight.riderID = nextRider.ID
+			flight.rider = nextRider
+		}
+	}
+	e.ordersMu.Unlock()
 }
 
 // AcceptOrder records rider acceptance, transitioning StateOffered -> StateAssigned and disarming the reaper.
@@ -221,6 +270,15 @@ func (e *Engine) AcceptOrder(riderID string, orderID uint64) bool {
 		delete(e.offers, orderID)
 	}
 	e.offersMu.Unlock()
+
+	// Update order flight state
+	e.ordersMu.Lock()
+	if flight, exists := e.orders[orderID]; exists {
+		flight.status = OrderStatusAssigned
+		flight.riderID = riderID
+		flight.rider = rider
+	}
+	e.ordersMu.Unlock()
 
 	return true
 }
@@ -246,8 +304,34 @@ func (e *Engine) RejectOrder(riderID string, orderID uint64) bool {
 	}
 
 	// 2. Instant 0ms cascade to next candidate
-	_, _ = e.tryOfferCandidates(offer.order, offer.candidates, offer.candIndex+1, offer.maxK, offer.limit)
+	nextRider, err := e.tryOfferCandidates(offer.order, offer.candidates, offer.candIndex+1, offer.maxK, offer.limit)
+	e.ordersMu.Lock()
+	if flight, exists := e.orders[orderID]; exists {
+		if err != nil {
+			flight.status = OrderStatusExhausted
+			flight.riderID = ""
+			flight.rider = nil
+		} else {
+			flight.status = OrderStatusOffered
+			flight.riderID = nextRider.ID
+			flight.rider = nextRider
+		}
+	}
+	e.ordersMu.Unlock()
+
 	return true
+}
+
+// GetOrderStatus returns the current dispatch status and assigned/offered rider ID for an order.
+func (e *Engine) GetOrderStatus(orderID uint64) (string, string, error) {
+	e.ordersMu.Lock()
+	defer e.ordersMu.Unlock()
+
+	flight, exists := e.orders[orderID]
+	if !exists {
+		return "", "", ErrOrderNotFound
+	}
+	return flight.status, flight.riderID, nil
 }
 
 // ClearOrder removes an order from the idempotency registry once delivered or cancelled.
